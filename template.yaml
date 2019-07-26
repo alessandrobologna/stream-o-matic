@@ -1,0 +1,705 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SAM template for Stream-O-Matic
+Parameters:
+  Stage:
+    Type: String
+  ProjectName:
+    Type: String
+  PythonVersion:
+    Type: String
+    Default: python3.7
+
+Globals:
+  Function:
+    Runtime: !Ref 'PythonVersion'
+    Timeout: 300
+    MemorySize: 256
+    Tracing: Active
+    Layers:
+      - !Ref 'Runtime'
+
+Outputs:
+  DataBucket:
+    Value: !Ref 'DataBucket'
+    Export:
+      Name: !Sub '${AWS::StackName}-exports-data-bucket'
+  Runtime:
+    Value: !Ref 'Runtime'
+    Export:
+      Name: !Sub '${AWS::StackName}-exports-runtime'
+  DataStream:
+    Value: !Ref 'DataStream'
+    Export:
+      Name: !Sub '${AWS::StackName}-exports-data-stream'
+  DataStreamArn:
+    Value: !GetAtt 'DataStream.Arn'
+    Export:
+      Name: !Sub '${AWS::StackName}-exports-data-stream-arn'
+  ControlStream:
+    Value: !Ref 'ControlStream'
+    Export:
+      Name: !Sub '${AWS::StackName}-exports-control-stream'
+  ControlStreamArn:
+    Value: !GetAtt 'ControlStream.Arn'
+    Export:
+      Name: !Sub '${AWS::StackName}-exports-control-stream-arn'
+
+Resources:
+  Runtime:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      RetentionPolicy: Retain
+      LayerName: !Sub '${ProjectName}-layer-${Stage}'
+      ContentUri: runtime/
+      CompatibleRuntimes:
+        - python3.7
+
+  DataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-datastream-${Stage}'
+      ShardCount: 1
+
+  DataStreamConsumer:
+    Type: AWS::Kinesis::StreamConsumer
+    Properties:
+      ConsumerName: demux
+      StreamARN: !GetAtt 'DataStream.Arn'
+
+  ControlStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${ProjectName}-controlstream-${Stage}'
+      ShardCount: 1
+
+  FirehoseDefaultProcessor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-firehose-default-processor-${Stage}'
+      Handler: data.default_processor.handler
+      CodeUri: src/
+      MemorySize: 1024
+
+  Inspector:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-stream-inspector-${Stage}'
+      Handler: control.stream_inspector.handler
+      CodeUri: src/
+      MemorySize: 256
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt 'ControlStream.Arn'
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+            Enabled: true
+
+  PartitionsMapper:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-partitions-mapper-${Stage}'
+      Handler: control.partitions_mapper.handler
+      CodeUri: src/
+      MemorySize: 256
+      Environment:
+        Variables:
+          GLUE_TABLES_LOCATOR: !Ref 'GlueTablesLocatorTable'
+          GLUE_PARTITIONS_MAPPER: !Ref 'GluePartitionsMapperTable'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref 'GluePartitionsMapperTable'
+        - DynamoDBReadPolicy:
+            TableName: !Ref 'GlueTablesLocatorTable'
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt 'ControlStream.Arn'
+            StartingPosition: LATEST
+            BatchSize: 100
+
+  StreamPublisher:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-stream-publisher-${Stage}'
+      Handler: control.stream_publisher.handler
+      CodeUri: src/
+      MemorySize: 256
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              Resource:
+                - '*'
+      Events:
+        Dynamo:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt 'GluePartitionsMapperTable.StreamArn'
+            StartingPosition: LATEST
+            BatchSize: 100
+
+  PartitionsUpdater:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-partitions-updater-${Stage}'
+      Handler: control.partitions_updater.handler
+      CodeUri: src/
+      MemorySize: 256
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref 'DataBucket'
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref 'DataBucket'
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - glue:UpdatePartition
+                - glue:CreatePartition
+                - glue:GetTableVersions
+                - glue:GetTable
+              Resource:
+                - '*'
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt 'ControlStream.Arn'
+            StartingPosition: LATEST
+            BatchSize: 100
+
+  PartitionsCompactor:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-partitions-compactor-${Stage}'
+      Handler: control.partitions_compactor.handler
+      CodeUri: src/
+      MemorySize: 256
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref 'DataBucket'
+          TMP_DATABASE: !Ref 'TmpDatabase'
+          COMPACTED_PARTITIONS: !Ref 'CompactedPartitionsTable'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref 'CompactedPartitionsTable'
+        - S3CrudPolicy:
+            BucketName: !Ref 'DataBucket'
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - glue:GetTableVersions
+                - glue:GetTable
+                - glue:CreateTable
+                - glue:GetPartition
+                - athena:StartQueryExecution
+              Resource:
+                - '*'
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt 'ControlStream.Arn'
+            StartingPosition: LATEST
+            BatchSize: 100
+
+  GlueTablesLocator:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-glue-tables-locator-${Stage}'
+      Handler: control.tables_locator.handler
+      CodeUri: src/
+      MemorySize: 256
+      Environment:
+        Variables:
+          GLUE_TABLES_LOCATOR: !Ref 'GlueTablesLocatorTable'
+          TMP_DATABASE: !Ref 'TmpDatabase'
+          DATA_BUCKET: !Ref 'DataBucket'
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref 'GlueTablesLocatorTable'
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - glue:GetTable
+                - glue:GetTableVersions
+              Resource:
+                - '*'
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt 'ControlStream.Arn'
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+
+  CompactedPartitionsLinker:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-partitions-linker-${Stage}'
+      Handler: control.partitions_linker.handler
+      CodeUri: src/
+      MemorySize: 256
+      Environment:
+        Variables:
+          COMPACTED_PARTITIONS: !Ref 'CompactedPartitionsTable'
+          TMP_DATABASE: !Ref 'TmpDatabase'
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref 'CompactedPartitionsTable'
+        - S3CrudPolicy:
+            BucketName: !Ref 'DataBucket'
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - glue:DeleteTable
+              Resource:
+                - '*'
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt 'ControlStream.Arn'
+            StartingPosition: LATEST
+            BatchSize: 100
+
+  LogStreamFactory:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-logstream-factory-${Stage}'
+      Handler: control.logstream_factory.handler
+      CodeUri: src/
+      MemorySize: 256
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogStream
+                - logs:DeleteLogStream
+              Resource:
+                - '*'
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt 'ControlStream.Arn'
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+
+  FirehoseFactory:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-firehose-factory-${Stage}'
+      Handler: control.firehose_factory.handler
+      CodeUri: src/
+      MemorySize: 1024
+      Environment:
+        Variables:
+          firehose_log_group: !Ref 'LogGroup'
+          firehose_role_arn: !GetAtt 'FireHoseDeliveryRole.Arn'
+          firehose_processors_lambda_arn: !GetAtt 'FirehoseDefaultProcessor.Arn'
+          TMP_DATABASE: !Ref 'TmpDatabase'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - glue:GetTable
+                - glue:GetTableVersions
+              Resource:
+                - '*'
+            - Effect: Allow
+              Action:
+                - firehose:CreateDeliveryStream
+                - firehose:DeleteDeliveryStream
+              Resource:
+                - '*'
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource:
+                - !GetAtt 'FireHoseDeliveryRole.Arn'
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt 'ControlStream.Arn'
+            StartingPosition: TRIM_HORIZON
+            BatchSize: 100
+
+  EventsPublisher:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-events-publisher-${Stage}'
+      Handler: control.events_publisher.handler
+      CodeUri: src/
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONTROL_STREAM: !Ref 'ControlStream'
+      Policies:
+        - KinesisCrudPolicy:
+            StreamName: !Ref 'ControlStream'
+      # Events:
+      #   S3Event:
+      #     Type: CloudWatchEvent
+      #     Properties:
+      #       Pattern:
+      #         source:
+      #           - aws.s3
+      #         detail-type:
+      #           - 'AWS API Call via CloudTrail'
+      #         detail:
+      #           eventSource:
+      #             - s3.amazonaws.com
+      #           eventName:
+      #             - CopyObject
+      #             - PutObject
+      #             - CompleteMultipartUpload
+      #           requestParameters:
+      #             bucketName:
+      #               - !Ref DataBucket
+
+  Demultiplexer:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-demultiplexer-${Stage}'
+      Handler: data.demux.handler
+      CodeUri: src/
+      MemorySize: 1024
+      Timeout: 600
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - firehose:PutRecord*
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - kinesis:*
+              Resource:
+                - !GetAtt 'DataStream.Arn'
+            - Effect: Allow
+              Action:
+                - kinesis:SubscribeToShard
+              Resource:
+                - !GetAtt 'DataStreamConsumer.ConsumerARN'
+      Environment:
+        Variables:
+          DATA_STREAM: !Ref 'DataStream'
+      Events:
+        Stream:
+          Type: Kinesis
+          Properties:
+            Stream: !GetAtt 'DataStreamConsumer.ConsumerARN'
+            StartingPosition: LATEST
+            BatchSize: 100
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}.data.${Stage}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: false
+
+  TrailsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}.trails.${Stage}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: false
+
+  FireHoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref 'AWS::AccountId'
+
+  FireHoseDeliveryPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-firehosedelivery-${Stage}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:PutObject
+            Resource:
+              - !Sub 'arn:aws:s3:::${DataBucket}'
+              - !Sub 'arn:aws:s3:::${DataBucket}/*'
+          - Effect: Allow
+            Action:
+              - glue:GetTable
+              - glue:GetTableVersions
+            Resource:
+              - '*'
+          - Effect: Allow
+            Action:
+              - logs:PutLogEvents
+            Resource:
+              - '*'
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+              - lambda:GetFunctionConfiguration
+            Resource:
+              - '*'
+      Roles:
+        - !Ref 'FireHoseDeliveryRole'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/firehose/${ProjectName}-${Stage}'
+
+  GlueNotificationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-glue-events-${Stage}'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - Glue Data Catalog Database State Change
+      Targets:
+        - Arn: !GetAtt 'ControlStream.Arn'
+          Id: !Sub '${ProjectName}-glue-events-kinesis-${Stage}'
+          RoleArn: !GetAtt 'EventsDeliveryRole.Arn'
+          KinesisParameters:
+            PartitionKeyPath: $.source
+
+  FirehoseNotificationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-firehose-events-${Stage}'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.firehose
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - firehose.amazonaws.com
+          eventName:
+            - CreateDeliveryStream
+      Targets:
+        - Arn: !GetAtt 'ControlStream.Arn'
+          Id: !Sub '${ProjectName}-firehose-events-kinesis-${Stage}'
+          RoleArn: !GetAtt 'EventsDeliveryRole.Arn'
+          KinesisParameters:
+            PartitionKeyPath: $.source
+
+  S3NotificationEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: !Sub '${ProjectName}-s3-events-${Stage}'
+      State: "ENABLED"
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - 'AWS API Call via CloudTrail'
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - CopyObject
+            - PutObject
+            - CompleteMultipartUpload
+          requestParameters:
+            bucketName:
+              - !Ref DataBucket
+      Targets: 
+        - Arn: !GetAtt 'ControlStream.Arn'
+          Id: !Sub '${ProjectName}-s3-events-kinesis-${Stage}'
+          RoleArn: !GetAtt 'EventsDeliveryRole.Arn'
+          KinesisParameters:
+            PartitionKeyPath: $.source
+
+  CustomEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-partition-events-${Stage}'
+      State: ENABLED
+      EventPattern:
+        source:
+          - custom.partition.event
+        detail-type:
+          - Partition State Change
+      Targets:
+        - Arn: !GetAtt 'ControlStream.Arn'
+          Id: !Sub '${ProjectName}-firehose-events-kinesis-${Stage}'
+          RoleArn: !GetAtt 'EventsDeliveryRole.Arn'
+          KinesisParameters:
+            PartitionKeyPath: $.detail.Event
+
+  EventsDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+
+  EventsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-eventdelivery-${Stage}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - kinesis:PutRecord
+              - kinesis:PutRecords
+            Resource:
+              - !GetAtt 'ControlStream.Arn'
+      Roles:
+        - !Ref 'EventsDeliveryRole'
+        
+  GlueTablesLocatorTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-glue-tables-locator-table-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: location
+          AttributeType: S
+      KeySchema:
+        - AttributeName: location
+          KeyType: HASH
+
+  GluePartitionsMapperTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-glue-partition-mapper-table-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      AttributeDefinitions:
+        - AttributeName: locator
+          AttributeType: S
+        - AttributeName: partition
+          AttributeType: S
+        - AttributeName: state
+          AttributeType: S
+      KeySchema:
+        - AttributeName: locator
+          KeyType: HASH
+        - AttributeName: partition
+          KeyType: RANGE
+      GlobalSecondaryIndexes: 
+        - IndexName: "state-index"
+          KeySchema: 
+            - AttributeName: "locator"
+              KeyType: "HASH"
+            - AttributeName: "state"
+              KeyType: "RANGE"
+          Projection: 
+              ProjectionType: "ALL"
+
+  CompactedPartitionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-compacted-partitions-table-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: tmptable
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tmptable
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiry
+        Enabled: true
+
+  TrailsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref 'TrailsBucket'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub 'arn:aws:s3:::${TrailsBucket}'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub 'arn:aws:s3:::${TrailsBucket}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  CloudTrail:
+    DependsOn:
+      - TrailsBucketPolicy
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: !Sub '${ProjectName}-trail-${Stage}'
+      S3BucketName: !Ref 'TrailsBucket'
+      IsLogging: true
+      EventSelectors:
+        - DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub 'arn:aws:s3:::${DataBucket}/'
+          ReadWriteType: WriteOnly
+
+  TmpDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref 'AWS::AccountId'
+      DatabaseInput:
+        Name: 'tmpdb'
+         

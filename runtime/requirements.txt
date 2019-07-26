@@ -1,0 +1,13 @@
+aws-lambda-logging==0.1.1
+aws-xray-sdk==2.2.0
+Jinja2==2.10
+python-dateutil==2.7.5
+pytimeparse==1.1.8
+PyYAML==3.13
+backoff==1.8.0
+cachetools==3.0.0
+fastavro==0.21.19
+aws-kinesis-agg==1.1.0
+jsonpath-ng==1.4.3
+boto3==1.9.180
+botocore==1.12.180
