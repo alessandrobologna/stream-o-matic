@@ -1,6 +1,5 @@
-# firehose-glue-automation
-Automatically create a Kinesis Firehose for each Glue Table 
-
+# Stream-O-Matic
+Code the medium article
 
 1. Create and activate a Python Virtual Environment:
 
