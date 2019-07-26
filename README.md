@@ -21,12 +21,10 @@ pip install --upgrade aws-sam-cli
 pip install -r runtime/requirements.txt
 ```
 
-4. Deploy the loader code:
+4. Deploy the code
 
 ```bash
-cd loader
 make all
-cd -
 ```
 
 The `Makefile` in each module just wraps the build/package/deploy for `sam`. 
